@@ -28,6 +28,10 @@ jobs:
           # 注意：这里直接从 AOSP 预编译仓库下载单分支以节省空间
           git clone --depth=1 -b android15-release https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 $GITHUB_WORKSPACE/clang
 
+      - name: SetUp KernelSU
+        run: curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+      
+      
       - name: Build Kernel
         run: |
           # 1. 设置环境变量
