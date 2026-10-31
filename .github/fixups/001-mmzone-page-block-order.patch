@@ -1,0 +1,20 @@
+--- a/include/linux/mmzone.h
++++ b/include/linux/mmzone.h
+@@ -35,6 +35,17 @@
+ 
+ #ifdef CONFIG_HONOR_ZONE_ISOLATE
+ #define ZONE_ISOLATE_COUNT 4
++#endif
++
++/* Defines the order for the number of pages that have a migrate type. */
++#ifndef CONFIG_PAGE_BLOCK_ORDER
++#define PAGE_BLOCK_ORDER MAX_ORDER
++#else
++#define PAGE_BLOCK_ORDER CONFIG_PAGE_BLOCK_ORDER
++#endif /* CONFIG_PAGE_BLOCK_ORDER */
++
++#if (PAGE_BLOCK_ORDER > MAX_ORDER)
++#error MAX_ORDER must be >= PAGE_BLOCK_ORDER
+ #endif
+ 
+ /*
