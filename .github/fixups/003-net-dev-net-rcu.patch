@@ -1,21 +1,3 @@
---- a/include/net/net_namespace.h
-+++ b/include/net/net_namespace.h
-@@ -397,6 +397,15 @@
- {
- #ifdef CONFIG_NET_NS
- 	return pnet->net;
-+#else
-+	return &init_net;
-+#endif
-+}
-+
-+static inline struct net *read_pnet_rcu(const possible_net_t *pnet)
-+{
-+#ifdef CONFIG_NET_NS
-+	return rcu_dereference(pnet->net);
- #else
- 	return &init_net;
- #endif
 --- a/include/linux/netdevice.h
 +++ b/include/linux/netdevice.h
 @@ -2577,6 +2577,12 @@
