@@ -381,6 +381,16 @@ jobs:
           fi
           echo "内核版本: $(make -s kernelversion)"
 
+      - name: Apply fixups
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/src"
+          shopt -s nullglob
+          for p in .github/fixups/*.patch; do
+            echo "== applying $p"
+            patch -p1 --forward --batch --no-backup-if-mismatch < "$p"
+          done
+
       - name: Inject SukiSU
         if: ${{ inputs.with_sukisu }}
         run: |
