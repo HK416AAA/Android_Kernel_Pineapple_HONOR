@@ -31,6 +31,7 @@ on:
         options:
           - upstream
           - vendor
+          - vendor-files
           - manual
         default: upstream
       defconfig:
@@ -236,6 +237,7 @@ jobs:
           rsync -a --exclude='.git' "$GITHUB_WORKSPACE/vendor/" ./
           git add -Af
           git commit -qm "ours: vendor tree"
+          git branch -f vendor HEAD
 
           # theirs = 上游目标版本（基于 base，保证有共同祖先）
           git checkout -q base
@@ -251,9 +253,10 @@ jobs:
           comm -12 "$REPORT/vendor-touched.txt" "$REPORT/upstream-touched.txt" > "$REPORT/overlap.txt"
 
           case "$CONFLICT_POLICY" in
-            upstream) MERGE_ARGS="-X theirs" ;;
-            vendor)   MERGE_ARGS="-X ours" ;;
-            manual)   MERGE_ARGS="" ;;
+            upstream)     MERGE_ARGS="-X theirs" ;;
+            vendor)       MERGE_ARGS="-X ours" ;;
+            vendor-files) MERGE_ARGS="-X ours" ;;
+            manual)       MERGE_ARGS="" ;;
             *) echo "未知冲突策略: $CONFLICT_POLICY"; exit 1 ;;
           esac
 
@@ -308,11 +311,22 @@ jobs:
             exit 1
           fi
 
+          # vendor-files：Honor 改过的文件整体回到 vendor 版本，其余文件取 6.1.156
+          if [ "$CONFLICT_POLICY" = "vendor-files" ]; then
+            xargs -a "$REPORT/vendor-touched.txt" -r -n 200 git checkout vendor -- 2>/dev/null || true
+            git diff --name-status base vendor | awk '$1 == "D" {print $2}' > "$REPORT/vendor-deleted.txt"
+            xargs -a "$REPORT/vendor-deleted.txt" -r -n 200 git rm -f -- 2>/dev/null || true
+            git add -A
+            git -c core.editor=true commit -q --no-edit || true
+            echo "vendor-files: restored $(wc -l < "$REPORT/vendor-touched.txt") vendor paths"
+          fi
+
           # 双方都改过的文件：记录合并相对 vendor 的改动，便于事后核对有没有丢 Honor 的代码
           if [ -s "$REPORT/overlap.txt" ]; then
-            xargs -a "$REPORT/overlap.txt" -r git diff --stat ours HEAD -- > "$REPORT/overlap-stat.txt" 2>/dev/null || true
-            xargs -a "$REPORT/overlap.txt" -r git diff ours HEAD -- 2>/dev/null | gzip -9 > "$REPORT/overlap.diff.gz" || true
-            echo "overlap diff: $(du -h "$REPORT/overlap.diff.gz" | cut -f1)"
+            xargs -a "$REPORT/overlap.txt" -r git diff --stat vendor HEAD -- > "$REPORT/overlap-stat.txt" 2>"$REPORT/overlap-diff.err" || true
+            xargs -a "$REPORT/overlap.txt" -r git diff vendor HEAD -- 2>>"$REPORT/overlap-diff.err" | gzip -9 > "$REPORT/overlap.diff.gz" || true
+            tar -czf "$REPORT/overlap-files.tar.gz" -C "$GITHUB_WORKSPACE/src" -T "$REPORT/overlap.txt" 2>/dev/null || true
+            echo "overlap diff: $(du -h "$REPORT/overlap.diff.gz" | cut -f1), files: $(du -h "$REPORT/overlap-files.tar.gz" | cut -f1)"
           fi
 
           # 把合并结果同步到工作目录用于编译
