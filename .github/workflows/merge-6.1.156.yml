@@ -35,7 +35,7 @@ on:
           - union
           - stable-apply
           - manual
-        default: upstream
+        default: vendor-files
       defconfig:
         description: 'arm64 defconfig 名'
         required: true
