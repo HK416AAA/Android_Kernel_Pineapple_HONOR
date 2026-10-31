@@ -210,7 +210,8 @@ jobs:
       - name: Three-way merge
         run: |
           set -euo pipefail
-          mkdir -p merge-report
+          REPORT="$GITHUB_WORKSPACE/merge-report"
+          mkdir -p "$REPORT"
           git init -q /tmp/merge
           cd /tmp/merge
           git config user.name  "merge-ci"
@@ -225,14 +226,15 @@ jobs:
 
           # base = 上游基线版本
           rsync -a /tmp/trees/base/ ./
-          git add -A
+          git add -Af
           git commit -qm "base: $BASE_VERSION"
+          git branch -f base HEAD
 
           # ours = 当前 vendor 树
           git checkout -q -b ours
           wipe_tree
           rsync -a --exclude='.git' "$GITHUB_WORKSPACE/vendor/" ./
-          git add -A
+          git add -Af
           git commit -qm "ours: vendor tree"
 
           # theirs = 上游目标版本（基于 base，保证有共同祖先）
@@ -240,13 +242,13 @@ jobs:
           git checkout -q -b theirs
           wipe_tree
           rsync -a /tmp/trees/target/ ./
-          git add -A
+          git add -Af
           git commit -qm "theirs: $TARGET_VERSION"
 
           git checkout -q ours
-          git diff --name-only base ours   | sort > merge-report/vendor-touched.txt
-          git diff --name-only base theirs | sort > merge-report/upstream-touched.txt
-          comm -12 merge-report/vendor-touched.txt merge-report/upstream-touched.txt > merge-report/overlap.txt
+          git diff --name-only base ours   | sort > "$REPORT/vendor-touched.txt"
+          git diff --name-only base theirs | sort > "$REPORT/upstream-touched.txt"
+          comm -12 "$REPORT/vendor-touched.txt" "$REPORT/upstream-touched.txt" > "$REPORT/overlap.txt"
 
           case "$CONFLICT_POLICY" in
             upstream) MERGE_ARGS="-X theirs" ;;
@@ -261,7 +263,7 @@ jobs:
           MERGE_RC=$?
           set -e
           tail -n 60 /tmp/merge.log || true
-          cp /tmp/merge.log merge-report/merge.log
+          cp /tmp/merge.log "$REPORT/merge.log"
 
           # 合并没有真正开始时（例如无关历史），不要带着旧树继续编译
           if [ "$MERGE_RC" -ne 0 ] && [ ! -f .git/MERGE_HEAD ]; then
@@ -269,8 +271,8 @@ jobs:
             exit 1
           fi
 
-          git diff --name-only --diff-filter=U | sort > merge-report/conflicts.txt
-          CONFLICTS=$(wc -l < merge-report/conflicts.txt)
+          git diff --name-only --diff-filter=U | sort > "$REPORT/conflicts.txt"
+          CONFLICTS=$(wc -l < "$REPORT/conflicts.txt")
           echo "残留冲突文件数: $CONFLICTS"
 
           # -X 策略仍可能残留少量冲突，按策略逐个兜底，避免把冲突标记带进编译
@@ -282,11 +284,11 @@ jobs:
             while IFS= read -r f; do
               [ -n "$f" ] || continue
               git checkout "$SIDE" -- "$f" 2>/dev/null || git rm -qf "$f" 2>/dev/null || true
-            done < merge-report/conflicts.txt
+            done < "$REPORT/conflicts.txt"
             git add -A
             git -c core.editor=true commit -q --no-edit || true
-            git diff --name-only --diff-filter=U | sort > merge-report/conflicts-remaining.txt
-            echo "兜底后残留冲突: $(wc -l < merge-report/conflicts-remaining.txt)"
+            git diff --name-only --diff-filter=U | sort > "$REPORT/conflicts-remaining.txt"
+            echo "兜底后残留冲突: $(wc -l < "$REPORT/conflicts-remaining.txt")"
           fi
 
           {
@@ -295,11 +297,11 @@ jobs:
             echo "target=$TARGET_VERSION $TARGET_SHA"
             echo "merge_rc=$MERGE_RC"
             echo "conflicts=$CONFLICTS"
-            echo "vendor_touched=$(wc -l < merge-report/vendor-touched.txt)"
-            echo "upstream_touched=$(wc -l < merge-report/upstream-touched.txt)"
-            echo "overlap=$(wc -l < merge-report/overlap.txt)"
-          } > merge-report/summary.txt
-          cat merge-report/summary.txt
+            echo "vendor_touched=$(wc -l < "$REPORT/vendor-touched.txt")"
+            echo "upstream_touched=$(wc -l < "$REPORT/upstream-touched.txt")"
+            echo "overlap=$(wc -l < "$REPORT/overlap.txt")"
+          } > "$REPORT/summary.txt"
+          cat "$REPORT/summary.txt"
 
           if [ "$CONFLICT_POLICY" = "manual" ] && [ "$MERGE_RC" -ne 0 ]; then
             echo "::error::manual 策略下存在未解决冲突，详见 merge-report/conflicts.txt"
@@ -314,9 +316,9 @@ jobs:
             echo "### 合并结果"
             echo ""
             echo "- 策略: \`$CONFLICT_POLICY\`"
-            echo "- vendor 侧改动文件: $(wc -l < merge-report/vendor-touched.txt)"
-            echo "- 上游改动文件: $(wc -l < merge-report/upstream-touched.txt)"
-            echo "- 双方都改动: $(wc -l < merge-report/overlap.txt)"
+            echo "- vendor 侧改动文件: $(wc -l < "$REPORT/vendor-touched.txt")"
+            echo "- 上游改动文件: $(wc -l < "$REPORT/upstream-touched.txt")"
+            echo "- 双方都改动: $(wc -l < "$REPORT/overlap.txt")"
             echo "- 残留冲突: $CONFLICTS"
           } >> "$GITHUB_STEP_SUMMARY"
 
