@@ -32,6 +32,7 @@ on:
           - upstream
           - vendor
           - vendor-files
+          - union
           - manual
         default: upstream
       defconfig:
@@ -256,6 +257,16 @@ jobs:
             upstream)     MERGE_ARGS="-X theirs" ;;
             vendor)       MERGE_ARGS="-X ours" ;;
             vendor-files) MERGE_ARGS="-X ours" ;;
+            union)
+              # 双方都改过的文件按 union 合并：两边的行都保留，避免上游新增声明被丢掉
+              : > .gitattributes
+              while IFS= read -r f; do
+                [ -n "$f" ] && printf '%s merge=union\n' "$f"
+              done < "$REPORT/overlap.txt" > .gitattributes
+              git add .gitattributes
+              git commit -qm "ci: union merge attributes"
+              MERGE_ARGS=""
+              ;;
             manual)       MERGE_ARGS="" ;;
             *) echo "未知冲突策略: $CONFLICT_POLICY"; exit 1 ;;
           esac
@@ -319,6 +330,12 @@ jobs:
             git add -A
             git -c core.editor=true commit -q --no-edit || true
             echo "vendor-files: restored $(wc -l < "$REPORT/vendor-touched.txt") vendor paths"
+          fi
+
+          # 合并完成后去掉为 union 临时生成的 .gitattributes
+          if [ "$CONFLICT_POLICY" = "union" ] && [ -f .gitattributes ]; then
+            git rm -qf .gitattributes 2>/dev/null || rm -f .gitattributes
+            git -c core.editor=true commit -q --no-edit || true
           fi
 
           # 双方都改过的文件：记录合并相对 vendor 的改动，便于事后核对有没有丢 Honor 的代码
