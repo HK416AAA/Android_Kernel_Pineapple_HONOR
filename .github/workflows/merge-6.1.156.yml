@@ -324,12 +324,15 @@ jobs:
 
           # vendor-files：Honor 改过的文件整体回到 vendor 版本，其余文件取 6.1.156
           if [ "$CONFLICT_POLICY" = "vendor-files" ]; then
-            xargs -a "$REPORT/vendor-touched.txt" -r -n 200 git checkout vendor -- 2>/dev/null || true
-            git diff --name-status base vendor | awk '$1 == "D" {print $2}' > "$REPORT/vendor-deleted.txt"
-            xargs -a "$REPORT/vendor-deleted.txt" -r -n 200 git rm -f -- 2>/dev/null || true
+            git ls-tree -r --name-only vendor | sort > /tmp/vendor-exists.txt
+            comm -12 "$REPORT/vendor-touched.txt" /tmp/vendor-exists.txt > /tmp/restore.txt
+            xargs -a /tmp/restore.txt -r -n 200 git checkout vendor -- || true
+            git diff --name-status base vendor | awk '$1 == "D" {print $2}' > /tmp/vendor-deleted.txt
+            xargs -a /tmp/vendor-deleted.txt -r -n 200 git rm -qf -- || true
             git add -A
             git -c core.editor=true commit -q --no-edit || true
-            echo "vendor-files: restored $(wc -l < "$REPORT/vendor-touched.txt") vendor paths"
+            LEFT=$(xargs -a /tmp/restore.txt -r -n 200 git diff --name-only vendor -- 2>/dev/null | wc -l)
+            echo "vendor-files: restore list=$(wc -l < /tmp/restore.txt) deleted=$(wc -l < /tmp/vendor-deleted.txt) remaining-diff=$LEFT"
           fi
 
           # 合并完成后去掉为 union 临时生成的 .gitattributes
