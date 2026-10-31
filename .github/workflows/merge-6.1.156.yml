@@ -1,0 +1,394 @@
+name: Merge ACK upstream and build
+
+run-name: merge ${{ inputs.target_version }} -> ${{ inputs.defconfig }}
+
+# 在 CI 里完成：解析 ACK 上游版本点 -> 三方合并 -> 编译 -> 上传产物
+# 仓库本身的历史很浅（整树导入），所以不能用 git merge 直接合并上游，
+# 这里改成构造 base/ours/theirs 三个快照提交后做真正的三方合并。
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_version:
+        description: '目标稳定版本（ACK 子版本号）'
+        required: true
+        default: '6.1.156'
+      base_version:
+        description: '当前树的基线版本（三方合并的 base）'
+        required: true
+        default: '6.1.128'
+      target_commit:
+        description: '可选：目标版本的 ACK commit SHA（留空自动查找）'
+        required: false
+        default: ''
+      base_commit:
+        description: '可选：基线版本的 ACK commit SHA（留空自动查找）'
+        required: false
+        default: ''
+      conflict_policy:
+        description: '冲突处理策略'
+        type: choice
+        options:
+          - upstream
+          - vendor
+          - manual
+        default: upstream
+      defconfig:
+        description: 'arm64 defconfig 名'
+        required: true
+        default: 'merge_pineapple_defconfig'
+      clang_version:
+        description: 'AOSP prebuilts clang 版本目录'
+        required: true
+        default: 'r522817'
+      localversion:
+        description: '覆盖 CONFIG_LOCALVERSION（留空则沿用 defconfig）'
+        required: false
+        default: ''
+      with_sukisu:
+        description: '合并后注入 SukiSU'
+        type: boolean
+        default: true
+      strict_werror:
+        description: '严格 -Werror（合并后大概率失败）'
+        type: boolean
+        default: false
+      skip_build:
+        description: '只做合并，不编译'
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: merge-ack-${{ inputs.target_version }}
+  cancel-in-progress: false
+
+jobs:
+  merge-build:
+    runs-on: ubuntu-22.04
+    timeout-minutes: 300
+    env:
+      UPSTREAM_REPO: https://android.googlesource.com/kernel/common
+      UPSTREAM_REF: refs/heads/android14-6.1
+      TARGET_VERSION: ${{ inputs.target_version }}
+      BASE_VERSION: ${{ inputs.base_version }}
+      TARGET_SHA_IN: ${{ inputs.target_commit }}
+      BASE_SHA_IN: ${{ inputs.base_commit }}
+      CONFLICT_POLICY: ${{ inputs.conflict_policy }}
+      DEFCONFIG: ${{ inputs.defconfig }}
+      CLANG_VERSION: ${{ inputs.clang_version }}
+      LOCALVERSION: ${{ inputs.localversion }}
+      WITH_SUKISU: ${{ inputs.with_sukisu }}
+      STRICT_WERROR: ${{ inputs.strict_werror }}
+      SKIP_BUILD: ${{ inputs.skip_build }}
+
+    steps:
+      - name: Checkout vendor tree
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          path: vendor
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+            bc bison build-essential ccache cpio curl flex g++-multilib gcc-multilib git \
+            gperf libelf-dev libssl-dev libxml2 libxml2-utils lz4 lzop rsync \
+            xsltproc zip zlib1g-dev dwarves xz-utils
+
+      - name: Resolve upstream commits
+        run: |
+          python3 - <<'PY'
+          import json
+          import os
+          import sys
+          import time
+          import urllib.request
+
+          REPO = os.environ["UPSTREAM_REPO"]
+          REF = os.environ["UPSTREAM_REF"]
+          TARGET = os.environ["TARGET_VERSION"]
+          BASE = os.environ["BASE_VERSION"]
+
+
+          def load(url):
+              last = None
+              for attempt in range(4):
+                  try:
+                      req = urllib.request.Request(url, headers={"User-Agent": "merge-ci"})
+                      with urllib.request.urlopen(req, timeout=120) as resp:
+                          raw = resp.read().decode("utf-8", "replace")
+                      return json.loads(raw[raw.index("{"):])
+                  except Exception as exc:
+                      last = exc
+                      print("请求失败，%d 秒后重试: %s" % (3 * (attempt + 1), exc), file=sys.stderr)
+                      time.sleep(3 * (attempt + 1))
+              raise SystemExit("无法访问 %s（%s）" % (url, last))
+
+
+          def iter_log():
+              url = "%s/+log/%s/Makefile?format=JSON&n=100" % (REPO, REF)
+              scanned = 0
+              while url and scanned < 1000:
+                  data = load(url)
+                  entries = data.get("log", [])
+                  if not entries:
+                      return
+                  for entry in entries:
+                      yield entry
+                  scanned += len(entries)
+                  nxt = data.get("next")
+                  url = ("%s/+log/%s/Makefile?format=JSON&n=100&s=%s" % (REPO, REF, nxt)) if nxt else None
+
+
+          def locate(version):
+              # 优先取 "Merge 6.1.x into android14-6.1-lts"，回退到 "Linux 6.1.x"
+              prefixes = ["Merge %s into android14-6.1" % version, "Linux %s" % version]
+              for prefix in prefixes:
+                  for entry in iter_log():
+                      msg = entry["message"].splitlines()[0]
+                      if msg.startswith(prefix):
+                          return entry["commit"], msg
+              return None, None
+
+
+          plan = (
+              (BASE, "BASE_SHA", os.environ.get("BASE_SHA_IN", "").strip()),
+              (TARGET, "TARGET_SHA", os.environ.get("TARGET_SHA_IN", "").strip()),
+          )
+          result = {}
+          for version, key, override in plan:
+              if override:
+                  result[key] = (override, "手动指定")
+                  print("%s -> %s (手动指定)" % (version, override))
+                  continue
+              sha, msg = locate(version)
+              if not sha:
+                  sys.exit("未能定位上游版本 %s，可在 workflow 里手动填 target_commit" % version)
+              result[key] = (sha, msg)
+              print("%s -> %s  (%s)" % (version, sha, msg))
+
+          with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
+              for k, (v, _) in result.items():
+                  fh.write("%s=%s\n" % (k, v))
+          with open(os.environ["GITHUB_STEP_SUMMARY"], "a", encoding="utf-8") as fh:
+              fh.write("### 上游版本点\n\n| 版本 | commit | 说明 |\n| --- | --- | --- |\n")
+              for version, key, _ in plan:
+                  fh.write("| %s | `%s` | %s |\n" % (version, result[key][0], result[key][1]))
+          PY
+
+      - name: Download upstream trees
+        run: |
+          set -euo pipefail
+          mkdir -p /tmp/trees/base /tmp/trees/target
+          curl -fL --retry 5 --retry-delay 5 -o /tmp/base.tar.gz \
+            "$UPSTREAM_REPO/+archive/$BASE_SHA.tar.gz"
+          curl -fL --retry 5 --retry-delay 5 -o /tmp/target.tar.gz \
+            "$UPSTREAM_REPO/+archive/$TARGET_SHA.tar.gz"
+          tar -xzf /tmp/base.tar.gz -C /tmp/trees/base
+          tar -xzf /tmp/target.tar.gz -C /tmp/trees/target
+          rm -f /tmp/base.tar.gz /tmp/target.tar.gz
+          echo "base files:   $(find /tmp/trees/base -type f | wc -l)"
+          echo "target files: $(find /tmp/trees/target -type f | wc -l)"
+          echo "target version: $(sed -n 's/^SUBLEVEL = //p' /tmp/trees/target/Makefile)"
+
+      - name: Three-way merge
+        run: |
+          set -euo pipefail
+          mkdir -p merge-report
+          git init -q /tmp/merge
+          cd /tmp/merge
+          git config user.name  "merge-ci"
+          git config user.email "merge-ci@local"
+          git config core.autocrlf false
+          git config core.filemode false
+
+          wipe_tree() {
+            find . -mindepth 1 -maxdepth 1 ! -name .git -exec rm -rf {} +
+            git rm -rq --cached . >/dev/null 2>&1 || true
+          }
+
+          # base = 上游基线版本
+          rsync -a /tmp/trees/base/ ./
+          git add -A
+          git commit -qm "base: $BASE_VERSION"
+
+          # ours = 当前 vendor 树
+          git checkout -q -b ours
+          wipe_tree
+          rsync -a --exclude='.git' "$GITHUB_WORKSPACE/vendor/" ./
+          git add -A
+          git commit -qm "ours: vendor tree"
+
+          # theirs = 上游目标版本（基于 base，保证有共同祖先）
+          git checkout -q base
+          git checkout -q -b theirs
+          wipe_tree
+          rsync -a /tmp/trees/target/ ./
+          git add -A
+          git commit -qm "theirs: $TARGET_VERSION"
+
+          git checkout -q ours
+          git diff --name-only base ours   | sort > merge-report/vendor-touched.txt
+          git diff --name-only base theirs | sort > merge-report/upstream-touched.txt
+          comm -12 merge-report/vendor-touched.txt merge-report/upstream-touched.txt > merge-report/overlap.txt
+
+          case "$CONFLICT_POLICY" in
+            upstream) MERGE_ARGS="-X theirs" ;;
+            vendor)   MERGE_ARGS="-X ours" ;;
+            manual)   MERGE_ARGS="" ;;
+            *) echo "未知冲突策略: $CONFLICT_POLICY"; exit 1 ;;
+          esac
+
+          set +e
+          # shellcheck disable=SC2086
+          git merge --no-edit $MERGE_ARGS theirs > /tmp/merge.log 2>&1
+          MERGE_RC=$?
+          set -e
+          tail -n 60 /tmp/merge.log || true
+          cp /tmp/merge.log merge-report/merge.log
+
+          # 合并没有真正开始时（例如无关历史），不要带着旧树继续编译
+          if [ "$MERGE_RC" -ne 0 ] && [ ! -f .git/MERGE_HEAD ]; then
+            echo "::error::git merge 未进入合并状态，日志见 merge-report/merge.log"
+            exit 1
+          fi
+
+          git diff --name-only --diff-filter=U | sort > merge-report/conflicts.txt
+          CONFLICTS=$(wc -l < merge-report/conflicts.txt)
+          echo "残留冲突文件数: $CONFLICTS"
+
+          # -X 策略仍可能残留少量冲突，按策略逐个兜底，避免把冲突标记带进编译
+          if [ "$CONFLICTS" -gt 0 ] && [ "$CONFLICT_POLICY" != "manual" ]; then
+            SIDE="--theirs"
+            if [ "$CONFLICT_POLICY" = "vendor" ]; then
+              SIDE="--ours"
+            fi
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              git checkout "$SIDE" -- "$f" 2>/dev/null || git rm -qf "$f" 2>/dev/null || true
+            done < merge-report/conflicts.txt
+            git add -A
+            git -c core.editor=true commit -q --no-edit || true
+            git diff --name-only --diff-filter=U | sort > merge-report/conflicts-remaining.txt
+            echo "兜底后残留冲突: $(wc -l < merge-report/conflicts-remaining.txt)"
+          fi
+
+          {
+            echo "policy=$CONFLICT_POLICY"
+            echo "base=$BASE_VERSION $BASE_SHA"
+            echo "target=$TARGET_VERSION $TARGET_SHA"
+            echo "merge_rc=$MERGE_RC"
+            echo "conflicts=$CONFLICTS"
+            echo "vendor_touched=$(wc -l < merge-report/vendor-touched.txt)"
+            echo "upstream_touched=$(wc -l < merge-report/upstream-touched.txt)"
+            echo "overlap=$(wc -l < merge-report/overlap.txt)"
+          } > merge-report/summary.txt
+          cat merge-report/summary.txt
+
+          if [ "$CONFLICT_POLICY" = "manual" ] && [ "$MERGE_RC" -ne 0 ]; then
+            echo "::error::manual 策略下存在未解决冲突，详见 merge-report/conflicts.txt"
+            exit 1
+          fi
+
+          # 把合并结果同步到工作目录用于编译
+          mkdir -p "$GITHUB_WORKSPACE/src"
+          rsync -a --exclude='.git' /tmp/merge/ "$GITHUB_WORKSPACE/src/"
+
+          {
+            echo "### 合并结果"
+            echo ""
+            echo "- 策略: \`$CONFLICT_POLICY\`"
+            echo "- vendor 侧改动文件: $(wc -l < merge-report/vendor-touched.txt)"
+            echo "- 上游改动文件: $(wc -l < merge-report/upstream-touched.txt)"
+            echo "- 双方都改动: $(wc -l < merge-report/overlap.txt)"
+            echo "- 残留冲突: $CONFLICTS"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Pin kernel version
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/src"
+          SUB="${TARGET_VERSION##*.}"
+          sed -i "s/^VERSION = .*/VERSION = 6/; s/^PATCHLEVEL = .*/PATCHLEVEL = 1/; s/^SUBLEVEL = .*/SUBLEVEL = ${SUB}/; s/^EXTRAVERSION = .*/EXTRAVERSION =/" Makefile
+          sed -n '1,6p' Makefile
+          if [ -n "$LOCALVERSION" ]; then
+            sed -i "s|^CONFIG_LOCALVERSION=.*|CONFIG_LOCALVERSION=\"$LOCALVERSION\"|" "arch/arm64/configs/$DEFCONFIG"
+            grep -n 'CONFIG_LOCALVERSION=' "arch/arm64/configs/$DEFCONFIG"
+          fi
+          echo "内核版本: $(make -s kernelversion)"
+
+      - name: Inject SukiSU
+        if: ${{ inputs.with_sukisu }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/src"
+          curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
+
+      - name: Fetch clang
+        if: ${{ !inputs.skip_build }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$GITHUB_WORKSPACE/clang"
+          URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-$CLANG_VERSION.tar.gz"
+          if ! curl -fL --retry 5 --retry-delay 5 -o /tmp/clang.tar.gz "$URL"; then
+            echo "archive 方式失败，回退到 git clone"
+            git clone --depth=1 -b main \
+              https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 /tmp/prebuilts
+            cp -a "/tmp/prebuilts/clang-$CLANG_VERSION/." "$GITHUB_WORKSPACE/clang/"
+          else
+            tar -xzf /tmp/clang.tar.gz -C "$GITHUB_WORKSPACE/clang"
+          fi
+          "$GITHUB_WORKSPACE/clang/bin/clang" --version
+
+      - name: Build kernel
+        if: ${{ !inputs.skip_build }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/src"
+          export PATH="$GITHUB_WORKSPACE/clang/bin:$PATH"
+          export ARCH=arm64
+          MAKE_ARGS="O=out ARCH=arm64 LLVM=1 LLVM_IAS=1"
+          if [ "$STRICT_WERROR" != "true" ]; then
+            MAKE_ARGS="$MAKE_ARGS KCFLAGS=-Wno-error"
+          fi
+          make $MAKE_ARGS "$DEFCONFIG" 2>&1 | tee "$GITHUB_WORKSPACE/build.log"
+          make -j"$(nproc)" $MAKE_ARGS Image Image.gz 2>&1 | tee -a "$GITHUB_WORKSPACE/build.log"
+          echo "kernelrelease: $(cat out/include/config/kernel.release)"
+
+      - name: Verify version
+        if: ${{ !inputs.skip_build }}
+        run: |
+          set -euo pipefail
+          cd "$GITHUB_WORKSPACE/src"
+          REL=$(cat out/include/config/kernel.release)
+          echo "kernelrelease: $REL"
+          case "$REL" in
+            "$TARGET_VERSION"*) echo "版本校验通过" ;;
+            *) echo "::error::kernelrelease ($REL) 与目标 $TARGET_VERSION 不一致"; exit 1 ;;
+          esac
+
+      - name: Upload reports
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: merge-report-${{ inputs.target_version }}
+          path: merge-report/
+          retention-days: 14
+
+      - name: Upload kernel
+        if: ${{ !inputs.skip_build && success() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: kernel-${{ inputs.target_version }}-${{ inputs.defconfig }}
+          path: |
+            src/out/arch/arm64/boot/Image
+            src/out/arch/arm64/boot/Image.gz
+            src/out/.config
+            src/out/System.map
+            build.log
+          if-no-files-found: warn
+          retention-days: 14
