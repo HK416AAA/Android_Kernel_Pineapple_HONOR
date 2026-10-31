@@ -326,13 +326,18 @@ jobs:
           if [ "$CONFLICT_POLICY" = "vendor-files" ]; then
             git ls-tree -r --name-only vendor | sort > /tmp/vendor-exists.txt
             comm -12 "$REPORT/vendor-touched.txt" /tmp/vendor-exists.txt > /tmp/restore.txt
-            xargs -a /tmp/restore.txt -r -n 200 git checkout vendor -- || true
+            # 逐个 checkout，避免某个路径失效导致整批 200 个文件全被跳过
+            RESTORED=0
+            while IFS= read -r f; do
+              [ -n "$f" ] || continue
+              if git checkout vendor -- "$f" 2>/dev/null; then RESTORED=$((RESTORED + 1)); fi
+            done < /tmp/restore.txt
             git diff --name-status base vendor | awk '$1 == "D" {print $2}' > /tmp/vendor-deleted.txt
             xargs -a /tmp/vendor-deleted.txt -r -n 200 git rm -qf -- || true
             git add -A
             git -c core.editor=true commit -q --no-edit || true
-            LEFT=$(xargs -a /tmp/restore.txt -r -n 200 git diff --name-only vendor -- 2>/dev/null | wc -l)
-            echo "vendor-files: restore list=$(wc -l < /tmp/restore.txt) deleted=$(wc -l < /tmp/vendor-deleted.txt) remaining-diff=$LEFT"
+            xargs -a /tmp/restore.txt -r -n 200 git diff --name-only vendor -- > "$REPORT/restore-missing.txt" 2>/dev/null || true
+            echo "vendor-files: want=$(wc -l < /tmp/restore.txt) restored=$RESTORED still-differ=$(wc -l < "$REPORT/restore-missing.txt")"
           fi
 
           # 合并完成后去掉为 union 临时生成的 .gitattributes
