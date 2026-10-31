@@ -426,13 +426,22 @@ jobs:
       - name: Apply fixups
         if: ${{ inputs.conflict_policy != 'stable-apply' }}
         run: |
-          set -euo pipefail
+          set -uo pipefail
           cd "$GITHUB_WORKSPACE/src"
+          REPORT="$GITHUB_WORKSPACE/merge-report"
+          mkdir -p "$REPORT"
+          : > "$REPORT/fixups.txt"
           shopt -s nullglob
           for p in .github/fixups/*.patch; do
-            echo "== applying $p"
-            patch -p1 --forward --batch --no-backup-if-mismatch < "$p"
+            if patch -p1 --forward --batch --no-backup-if-mismatch < "$p" >> "$REPORT/fixups.txt" 2>&1; then
+              echo "OK   $p"
+            else
+              echo "FAIL $p"
+              echo ">>> FAILED: $p" >> "$REPORT/fixups.txt"
+            fi
           done
+          find . -name '*.rej' -delete
+          find . -name '*.orig' -delete
 
       - name: Inject SukiSU
         if: ${{ inputs.with_sukisu }}
