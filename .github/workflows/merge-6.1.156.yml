@@ -33,6 +33,7 @@ on:
           - vendor
           - vendor-files
           - union
+          - stable-apply
           - manual
         default: upstream
       defconfig:
@@ -102,6 +103,7 @@ jobs:
             xsltproc zip zlib1g-dev dwarves xz-utils
 
       - name: Resolve upstream commits
+        if: ${{ inputs.conflict_policy != 'stable-apply' }}
         run: |
           python3 - <<'PY'
           import json
@@ -195,6 +197,7 @@ jobs:
           PY
 
       - name: Download upstream trees
+        if: ${{ inputs.conflict_policy != 'stable-apply' }}
         run: |
           set -euo pipefail
           mkdir -p /tmp/trees/base /tmp/trees/target
@@ -210,6 +213,7 @@ jobs:
           echo "target version: $(sed -n 's/^SUBLEVEL = //p' /tmp/trees/target/Makefile)"
 
       - name: Three-way merge
+        if: ${{ inputs.conflict_policy != 'stable-apply' }}
         run: |
           set -euo pipefail
           REPORT="$GITHUB_WORKSPACE/merge-report"
@@ -368,6 +372,44 @@ jobs:
             echo "- 残留冲突: $CONFLICTS"
           } >> "$GITHUB_STEP_SUMMARY"
 
+      - name: Apply stable patch series
+        if: ${{ inputs.conflict_policy == 'stable-apply' }}
+        run: |
+          set -uo pipefail
+          REPORT="$GITHUB_WORKSPACE/merge-report"
+          mkdir -p "$REPORT" "$GITHUB_WORKSPACE/src"
+          rsync -a --exclude='.git' "$GITHUB_WORKSPACE/vendor/" "$GITHUB_WORKSPACE/src/"
+          cd "$GITHUB_WORKSPACE/src"
+          FROM="${BASE_VERSION##*.}"
+          TO="${TARGET_VERSION##*.}"
+          : > "$REPORT/stable-rejects.txt"
+          FAILED=0
+          for ((n = FROM; n < TO; n++)); do
+            NEXT=$((n + 1))
+            URL="https://cdn.kernel.org/pub/linux/kernel/v6.x/incr/patch-6.1.$n-$NEXT.xz"
+            if ! curl -fsSL --retry 5 --retry-delay 3 -o /tmp/patch.xz "$URL"; then
+              echo "::warning::下载失败 $URL"
+              FAILED=$((FAILED + 1))
+              continue
+            fi
+            xz -dc /tmp/patch.xz > /tmp/patch.diff
+            if patch -p1 --forward --batch --no-backup-if-mismatch \
+                 --reject-file=/tmp/patch.rej < /tmp/patch.diff > /tmp/patch.log 2>&1; then
+              echo "6.1.$n -> 6.1.$NEXT : clean"
+            else
+              echo "6.1.$n -> 6.1.$NEXT : rejects"
+            fi
+            if [ -s /tmp/patch.rej ]; then
+              { echo ""; echo "### 6.1.$n -> 6.1.$NEXT"; cat /tmp/patch.rej; } >> "$REPORT/stable-rejects.txt"
+            fi
+            rm -f /tmp/patch.rej
+          done
+          find . -name '*.rej' -delete
+          find . -name '*.orig' -delete
+          echo "reject 行数: $(wc -l < "$REPORT/stable-rejects.txt")，下载失败: $FAILED"
+          sed -n '1,6p' Makefile
+          echo "kernelversion: $(make -s kernelversion)"
+
       - name: Pin kernel version
         run: |
           set -euo pipefail
@@ -382,6 +424,7 @@ jobs:
           echo "内核版本: $(make -s kernelversion)"
 
       - name: Apply fixups
+        if: ${{ inputs.conflict_policy != 'stable-apply' }}
         run: |
           set -euo pipefail
           cd "$GITHUB_WORKSPACE/src"
