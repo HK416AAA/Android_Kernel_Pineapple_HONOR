@@ -308,6 +308,13 @@ jobs:
             exit 1
           fi
 
+          # 双方都改过的文件：记录合并相对 vendor 的改动，便于事后核对有没有丢 Honor 的代码
+          if [ -s "$REPORT/overlap.txt" ]; then
+            xargs -a "$REPORT/overlap.txt" -r git diff --stat ours HEAD -- > "$REPORT/overlap-stat.txt" 2>/dev/null || true
+            xargs -a "$REPORT/overlap.txt" -r git diff ours HEAD -- 2>/dev/null | gzip -9 > "$REPORT/overlap.diff.gz" || true
+            echo "overlap diff: $(du -h "$REPORT/overlap.diff.gz" | cut -f1)"
+          fi
+
           # 把合并结果同步到工作目录用于编译
           mkdir -p "$GITHUB_WORKSPACE/src"
           rsync -a --exclude='.git' /tmp/merge/ "$GITHUB_WORKSPACE/src/"
