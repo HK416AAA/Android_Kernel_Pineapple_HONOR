@@ -112,6 +112,9 @@ jobs:
           REF = os.environ["UPSTREAM_REF"]
           TARGET = os.environ["TARGET_VERSION"]
           BASE = os.environ["BASE_VERSION"]
+          # 注意：gitiles 的 +log/<ref>/<path> 会要求登录（401），只能用不带 path 的 +log/<ref>
+          PAGE = 1000
+          MAX_SCAN = 60000
 
 
           def load(url):
@@ -130,9 +133,9 @@ jobs:
 
 
           def iter_log():
-              url = "%s/+log/%s/Makefile?format=JSON&n=100" % (REPO, REF)
+              url = "%s/+log/%s?format=JSON&n=%d" % (REPO, REF, PAGE)
               scanned = 0
-              while url and scanned < 1000:
+              while url and scanned < MAX_SCAN:
                   data = load(url)
                   entries = data.get("log", [])
                   if not entries:
@@ -141,19 +144,28 @@ jobs:
                       yield entry
                   scanned += len(entries)
                   nxt = data.get("next")
-                  url = ("%s/+log/%s/Makefile?format=JSON&n=100&s=%s" % (REPO, REF, nxt)) if nxt else None
+                  url = ("%s/+log/%s?format=JSON&n=%d&s=%s" % (REPO, REF, PAGE, nxt)) if nxt else None
 
 
-          def locate(version):
-              # 优先取 "Merge 6.1.x into android14-6.1-lts"，回退到 "Linux 6.1.x"
-              prefixes = ["Merge %s into android14-6.1" % version, "Linux %s" % version]
-              for prefix in prefixes:
-                  for entry in iter_log():
-                      msg = entry["message"].splitlines()[0]
-                      if msg.startswith(prefix):
-                          return entry["commit"], msg
-              return None, None
+          def scan(prefix_of):
+              # 一次遍历同时找 base 和 target，前缀匹配 “Merge 6.1.156 into android14-6.1-lts”
+              wanted = {BASE: None, TARGET: None}
+              for entry in iter_log():
+                  msg = entry["message"].splitlines()[0]
+                  for version in list(wanted):
+                      if wanted[version] is None and msg.startswith(prefix_of % version):
+                          wanted[version] = (entry["commit"], msg)
+                  if all(wanted.values()):
+                      break
+              return wanted
 
+
+          found = scan("Merge %s into android14-6.1")
+          if not all(found.values()):
+              fallback = scan("Linux %s")
+              for version, hit in fallback.items():
+                  if not found[version]:
+                      found[version] = hit
 
           plan = (
               (BASE, "BASE_SHA", os.environ.get("BASE_SHA_IN", "").strip()),
@@ -165,11 +177,11 @@ jobs:
                   result[key] = (override, "手动指定")
                   print("%s -> %s (手动指定)" % (version, override))
                   continue
-              sha, msg = locate(version)
-              if not sha:
+              hit = found.get(version)
+              if not hit:
                   sys.exit("未能定位上游版本 %s，可在 workflow 里手动填 target_commit" % version)
-              result[key] = (sha, msg)
-              print("%s -> %s  (%s)" % (version, sha, msg))
+              result[key] = hit
+              print("%s -> %s  (%s)" % (version, hit[0], hit[1]))
 
           with open(os.environ["GITHUB_ENV"], "a", encoding="utf-8") as fh:
               for k, (v, _) in result.items():
