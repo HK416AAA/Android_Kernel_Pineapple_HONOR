@@ -380,19 +380,42 @@ jobs:
           cd "$GITHUB_WORKSPACE/src"
           curl -LSs "https://raw.githubusercontent.com/ShirkNeko/SukiSU-Ultra/main/kernel/setup.sh" | bash -s main
 
+      - name: Cache clang
+        if: ${{ !inputs.skip_build }}
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/clang
+          key: clang-${{ inputs.clang_version }}-v1
+
       - name: Fetch clang
         if: ${{ !inputs.skip_build }}
         run: |
           set -euo pipefail
-          mkdir -p "$GITHUB_WORKSPACE/clang"
+          if [ -x "$GITHUB_WORKSPACE/clang/bin/clang" ]; then
+            echo "cache hit: $(ls -d "$GITHUB_WORKSPACE"/clang/* | head -1)"
+            "$GITHUB_WORKSPACE/clang/bin/clang" --version
+            exit 0
+          fi
           URL="https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86/+archive/refs/heads/main/clang-$CLANG_VERSION.tar.gz"
-          if ! curl -fL --retry 5 --retry-delay 5 -o /tmp/clang.tar.gz "$URL"; then
-            echo "archive 方式失败，回退到 git clone"
-            git clone --depth=1 -b main \
+          for attempt in 1 2 3; do
+            echo "== attempt $attempt"
+            if curl -fL --retry 5 --retry-delay 5 -o /tmp/clang.tar.gz "$URL" && gzip -t /tmp/clang.tar.gz; then
+              rm -rf "$GITHUB_WORKSPACE/clang" && mkdir -p "$GITHUB_WORKSPACE/clang"
+              if tar -xzf /tmp/clang.tar.gz -C "$GITHUB_WORKSPACE/clang"; then
+                break
+              fi
+            fi
+            rm -f /tmp/clang.tar.gz
+            sleep 10
+          done
+          if [ ! -x "$GITHUB_WORKSPACE/clang/bin/clang" ]; then
+            echo "archive 方式失败，回退到 sparse clone"
+            rm -rf /tmp/prebuilts "$GITHUB_WORKSPACE/clang"
+            git clone --depth=1 --filter=blob:none --sparse -b main \
               https://android.googlesource.com/platform/prebuilts/clang/host/linux-x86 /tmp/prebuilts
+            git -C /tmp/prebuilts sparse-checkout set "clang-$CLANG_VERSION"
+            mkdir -p "$GITHUB_WORKSPACE/clang"
             cp -a "/tmp/prebuilts/clang-$CLANG_VERSION/." "$GITHUB_WORKSPACE/clang/"
-          else
-            tar -xzf /tmp/clang.tar.gz -C "$GITHUB_WORKSPACE/clang"
           fi
           "$GITHUB_WORKSPACE/clang/bin/clang" --version
 
