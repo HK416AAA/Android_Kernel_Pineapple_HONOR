@@ -1,0 +1,12 @@
+--- a/include/trace/hooks/mm.h
++++ b/include/trace/hooks/mm.h
+@@ -312,6 +312,9 @@
+ 	TP_PROTO(struct file *file, pgoff_t orig_start_pgoff,
+ 		pgoff_t last_pgoff, vm_fault_t ret),
+ 	TP_ARGS(file, orig_start_pgoff, last_pgoff, ret));
++DECLARE_HOOK(android_vh_mempool_alloc_skip_wait,
++	TP_PROTO(gfp_t *gfp_flags, bool *skip_wait),
++	TP_ARGS(gfp_flags, skip_wait));
+ #endif /* _TRACE_HOOK_MM_H */
+ 
+ /* This part must be outside protection */
